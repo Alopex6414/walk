@@ -8,13 +8,12 @@ package walk
 
 import (
 	"fmt"
+	"runtime"
+	"strconv"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
-)
-
-import (
-	"strconv"
 
 	"github.com/lxn/win"
 )
@@ -26,13 +25,15 @@ const (
 	CloseReasonUser
 )
 
-var syncFuncs struct {
-	m     sync.Mutex
-	funcs []func()
-}
+var (
+	syncFuncs struct {
+		m     sync.Mutex
+		funcs []func()
+	}
 
-var syncMsgId uint32
-var taskbarButtonCreatedMsgId uint32
+	syncMsgId                 uint32
+	taskbarButtonCreatedMsgId uint32
+)
 
 func init() {
 	syncMsgId = win.RegisterWindowMessage(syscall.StringToUTF16Ptr("WalkSync"))
@@ -41,8 +42,8 @@ func init() {
 
 func synchronize(f func()) {
 	syncFuncs.m.Lock()
-	defer syncFuncs.m.Unlock()
 	syncFuncs.funcs = append(syncFuncs.funcs, f)
+	syncFuncs.m.Unlock()
 }
 
 func runSynchronized() {
@@ -71,8 +72,8 @@ type Form interface {
 	Title() string
 	SetTitle(title string) error
 	TitleChanged() *Event
-	Icon() *Icon
-	SetIcon(icon *Icon)
+	Icon() Image
+	SetIcon(icon Image) error
 	IconChanged() *Event
 	Owner() Form
 	SetOwner(owner Form) error
@@ -98,8 +99,9 @@ type FormBase struct {
 	titleChangedPublisher EventPublisher
 	iconChangedPublisher  EventPublisher
 	progressIndicator     *ProgressIndicator
-	icon                  *Icon
+	icon                  Image
 	prevFocusHWnd         win.HWND
+	proposedSize          Size
 	isInRestoreState      bool
 	started               bool
 	closeReason           CloseReason
@@ -153,9 +155,14 @@ func (fb *FormBase) init(form Form) error {
 			return fb.Title()
 		},
 		func(v interface{}) error {
-			return fb.SetTitle(v.(string))
+			return fb.SetTitle(assertStringOr(v, ""))
 		},
 		fb.titleChangedPublisher.Event()))
+
+	version := win.GetVersion()
+	if (version&0xFF) > 6 || ((version&0xFF) == 6 && (version&0xFF00>>8) > 0) {
+		win.ChangeWindowMessageFilterEx(fb.hWnd, taskbarButtonCreatedMsgId, win.MSGFLT_ALLOW, nil)
+	}
 
 	return nil
 }
@@ -200,9 +207,9 @@ func (fb *FormBase) SetLayout(value Layout) error {
 	return fb.clientComposite.SetLayout(value)
 }
 
-func (fb *FormBase) SetBounds(bounds Rectangle) error {
+func (fb *FormBase) SetBoundsPixels(bounds Rectangle) error {
 	if layout := fb.Layout(); layout != nil {
-		minSize := fb.sizeFromClientSize(layout.MinSize())
+		minSize := fb.sizeFromClientSizePixels(layout.MinSizeForSize(bounds.Size()))
 
 		if bounds.Width < minSize.Width {
 			bounds.Width = minSize.Width
@@ -212,7 +219,7 @@ func (fb *FormBase) SetBounds(bounds Rectangle) error {
 		}
 	}
 
-	if err := fb.WindowBase.SetBounds(bounds); err != nil {
+	if err := fb.WindowBase.SetBoundsPixels(bounds); err != nil {
 		return err
 	}
 
@@ -242,6 +249,10 @@ func (fb *FormBase) SetDataBinder(db *DataBinder) {
 }
 
 func (fb *FormBase) Suspended() bool {
+	if fb.clientComposite == nil {
+		return false
+	}
+
 	return fb.clientComposite.Suspended()
 }
 
@@ -270,10 +281,10 @@ func (fb *FormBase) onInsertedWidget(index int, widget Widget) error {
 	if err == nil {
 		if layout := fb.Layout(); layout != nil && !fb.Suspended() {
 			minClientSize := fb.Layout().MinSize()
-			clientSize := fb.clientComposite.Size()
+			clientSize := fb.clientComposite.SizePixels()
 
 			if clientSize.Width < minClientSize.Width || clientSize.Height < minClientSize.Height {
-				fb.SetClientSize(minClientSize)
+				fb.SetClientSizePixels(minClientSize)
 			}
 		}
 	}
@@ -350,6 +361,9 @@ func (fb *FormBase) SetRightToLeftLayout(rtl bool) error {
 }
 
 func (fb *FormBase) Run() int {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	if fb.owner != nil {
 		win.EnableWindow(fb.owner.Handle(), false)
 
@@ -371,15 +385,18 @@ func (fb *FormBase) Run() int {
 		layout.Update(false)
 	}
 
-	fb.focusFirstCandidateDescendant()
+	fb.clientComposite.focusFirstCandidateDescendant()
 
 	fb.started = true
 	fb.startingPublisher.Publish()
 
-	var msg win.MSG
+	fb.SetBoundsPixels(fb.BoundsPixels())
+
+	msg := (*win.MSG)(unsafe.Pointer(win.GlobalAlloc(0, unsafe.Sizeof(win.MSG{}))))
+	defer win.GlobalFree(win.HGLOBAL(unsafe.Pointer(msg)))
 
 	for fb.hWnd != 0 {
-		switch win.GetMessage(&msg, 0, 0, 0) {
+		switch win.GetMessage(msg, 0, 0, 0) {
 		case 0:
 			return int(msg.WParam)
 
@@ -389,14 +406,14 @@ func (fb *FormBase) Run() int {
 
 		switch msg.Message {
 		case win.WM_KEYDOWN:
-			if fb.webViewTranslateAccelerator(&msg) {
-				// handled accelerator key of webview and its childen (ie IE)
+			if fb.handleKeyDown(msg) {
+				continue
 			}
 		}
 
-		if !win.IsDialogMessage(fb.hWnd, &msg) {
-			win.TranslateMessage(&msg)
-			win.DispatchMessage(&msg)
+		if !win.IsDialogMessage(fb.hWnd, msg) {
+			win.TranslateMessage(msg)
+			win.DispatchMessage(msg)
 		}
 
 		runSynchronized()
@@ -405,8 +422,61 @@ func (fb *FormBase) Run() int {
 	return 0
 }
 
-func (fb *FormBase) webViewTranslateAccelerator(msg *win.MSG) bool {
+func (fb *FormBase) handleKeyDown(msg *win.MSG) bool {
 	ret := false
+
+	if key, mods := Key(msg.WParam), ModifiersDown(); key == KeyTab && (mods&ModControl) != 0 {
+		doTabbing := func(tw *TabWidget) {
+			index := tw.CurrentIndex()
+			if (mods & ModShift) != 0 {
+				index--
+				if index < 0 {
+					index = tw.Pages().Len() - 1
+				}
+			} else {
+				index++
+				if index >= tw.Pages().Len() {
+					index = 0
+				}
+			}
+			tw.SetCurrentIndex(index)
+		}
+
+		hwnd := win.GetFocus()
+
+	LOOP:
+		for hwnd != 0 {
+			window := windowFromHandle(hwnd)
+
+			switch widget := window.(type) {
+			case nil:
+
+			case *TabWidget:
+				doTabbing(widget)
+				return true
+
+			case Widget:
+
+			default:
+				break LOOP
+			}
+
+			hwnd = win.GetParent(hwnd)
+		}
+
+		walkDescendants(fb.window, func(w Window) bool {
+			if tw, ok := w.(*TabWidget); ok {
+				doTabbing(tw)
+				ret = true
+				return false
+			}
+			return true
+		})
+		if ret {
+			return true
+		}
+	}
+
 	walkDescendants(fb.window, func(w Window) bool {
 		if webView, ok := w.(*WebView); ok {
 			webViewHWnd := webView.Handle()
@@ -466,22 +536,36 @@ func (fb *FormBase) SetOwner(value Form) error {
 	return nil
 }
 
-func (fb *FormBase) Icon() *Icon {
+func (fb *FormBase) Icon() Image {
 	return fb.icon
 }
 
-func (fb *FormBase) SetIcon(icon *Icon) {
-	fb.icon = icon
+func (fb *FormBase) SetIcon(icon Image) error {
+	var hIconSmall, hIconBig uintptr
 
-	var hIcon uintptr
 	if icon != nil {
-		hIcon = uintptr(icon.hIcon)
+		smallIcon, err := iconCache.Icon(icon, fb.DPI())
+		if err != nil {
+			return err
+		}
+		hIconSmall = uintptr(smallIcon.handleForDPI(fb.DPI()))
+
+		bigDPI := int(48.0 / float64(icon.Size().Width) * 96.0)
+		bigIcon, err := iconCache.Icon(icon, bigDPI)
+		if err != nil {
+			return err
+		}
+		hIconBig = uintptr(bigIcon.handleForDPI(bigDPI))
 	}
 
-	fb.SendMessage(win.WM_SETICON, 0, hIcon)
-	fb.SendMessage(win.WM_SETICON, 1, hIcon)
+	fb.SendMessage(win.WM_SETICON, 0, hIconSmall)
+	fb.SendMessage(win.WM_SETICON, 1, hIconBig)
+
+	fb.icon = icon
 
 	fb.iconChangedPublisher.Publish()
+
+	return nil
 }
 
 func (fb *FormBase) IconChanged() *Event {
@@ -493,6 +577,8 @@ func (fb *FormBase) Hide() {
 }
 
 func (fb *FormBase) Show() {
+	fb.proposedSize = fb.minSize
+
 	if p, ok := fb.window.(Persistable); ok && p.Persistent() && appSingleton.settings != nil {
 		p.RestoreState()
 	}
@@ -582,7 +668,7 @@ func (fb *FormBase) RestoreState() error {
 	wp.Length = uint32(unsafe.Sizeof(wp))
 
 	if layout := fb.Layout(); layout != nil && fb.fixedSize() {
-		minSize := fb.sizeFromClientSize(layout.MinSize())
+		minSize := fb.sizeFromClientSizePixels(layout.MinSize())
 
 		wp.RcNormalPosition.Right = wp.RcNormalPosition.Left + int32(minSize.Width) - 1
 		wp.RcNormalPosition.Bottom = wp.RcNormalPosition.Top + int32(minSize.Height) - 1
@@ -646,17 +732,20 @@ func (fb *FormBase) WndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) u
 		return fb.clientComposite.WndProc(hwnd, msg, wParam, lParam)
 
 	case win.WM_GETMINMAXINFO:
-		if fb.Suspended() {
+		if fb.Suspended() || fb.proposedSize == (Size{}) {
 			break
 		}
 
 		mmi := (*win.MINMAXINFO)(unsafe.Pointer(lParam))
 
-		layout := fb.clientComposite.Layout()
-
 		var min Size
-		if layout != nil {
-			min = fb.sizeFromClientSize(layout.MinSize())
+		if layout := fb.clientComposite.layout; layout != nil {
+			size := fb.clientSizeFromSizePixels(fb.proposedSize)
+			min = fb.sizeFromClientSizePixels(layout.MinSizeForSize(size))
+
+			if fb.proposedSize.Width < min.Width {
+				min = fb.sizeFromClientSizePixels(layout.MinSizeForSize(min))
+			}
 		}
 
 		mmi.PtMinTrackSize = win.POINT{
@@ -671,8 +760,56 @@ func (fb *FormBase) WndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) u
 	case win.WM_SETTEXT:
 		fb.titleChangedPublisher.Publish()
 
-	case win.WM_SIZE, win.WM_SIZING:
-		fb.clientComposite.SetBounds(fb.window.ClientBounds())
+	case win.WM_SIZING:
+		rc := (*win.RECT)(unsafe.Pointer(lParam))
+
+		fb.proposedSize = rectangleFromRECT(*rc).Size()
+
+		fb.clientComposite.SetBoundsPixels(fb.window.ClientBoundsPixels())
+
+	case win.WM_SIZE:
+		fb.clientComposite.SetBoundsPixels(fb.window.ClientBoundsPixels())
+
+	case win.WM_DPICHANGED:
+		wasSuspended := fb.Suspended()
+		fb.SetSuspended(true)
+		defer fb.SetSuspended(wasSuspended)
+
+		dpi := int(win.HIWORD(uint32(wParam)))
+
+		seenInApplyFontToDescendantsDuringDPIChange = make(map[*WindowBase]bool)
+		seenInApplyDPIToDescendantsDuringDPIChange = make(map[*WindowBase]bool)
+		defer func() {
+			seenInApplyFontToDescendantsDuringDPIChange = nil
+			seenInApplyDPIToDescendantsDuringDPIChange = nil
+		}()
+
+		fb.clientComposite.ApplyDPI(dpi)
+		fb.ApplyDPI(dpi)
+		if fb.progressIndicator != nil {
+			fb.progressIndicator.SetOverlayIcon(fb.progressIndicator.overlayIcon, fb.progressIndicator.overlayIconDescription)
+		}
+		applyDPIToDescendants(fb.window, dpi)
+
+		rc := (*win.RECT)(unsafe.Pointer(lParam))
+		fb.window.SetBoundsPixels(rectangleFromRECT(*rc))
+
+		fb.SetIcon(fb.icon)
+
+		time.AfterFunc(time.Second, func() {
+			if fb.hWnd == 0 {
+				return
+			}
+			fb.Synchronize(func() {
+				for ni := range notifyIcons {
+					// We do this on all NotifyIcons, not just ones attached to this form or descendents, because
+					// the notify icon might be on a different screen, and since it can't get notifications itself
+					// we hope that one of the forms did for it. We also have to delay it by a second, because the
+					// tray usually gets resized sometime after us. This is a nasty hack!
+					ni.applyDPI()
+				}
+			})
+		})
 
 	case win.WM_SYSCOMMAND:
 		if wParam == win.SC_CLOSE {
@@ -684,62 +821,10 @@ func (fb *FormBase) WndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) u
 		major := version & 0xFF
 		minor := version & 0xFF00 >> 8
 		// Check that the OS is Win 7 or later (Win 7 is v6.1).
-		if major > 6 || (major == 6 && minor > 0) {
+		if fb.progressIndicator == nil && (major > 6 || (major == 6 && minor > 0)) {
 			fb.progressIndicator, _ = newTaskbarList3(fb.hWnd)
 		}
 	}
 
 	return fb.WindowBase.WndProc(hwnd, msg, wParam, lParam)
-}
-
-func (fb *FormBase) focusFirstCandidateDescendant() {
-	window := firstFocusableDescendant(fb)
-	if window == nil {
-		return
-	}
-
-	if err := window.SetFocus(); err != nil {
-		return
-	}
-
-	if textSel, ok := window.(textSelectable); ok {
-		textSel.SetTextSelection(0, -1)
-	}
-}
-
-func firstFocusableDescendantCallback(hwnd win.HWND, lParam uintptr) uintptr {
-	widget := windowFromHandle(hwnd)
-
-	if widget == nil || !widget.Visible() || !widget.Enabled() {
-		return 1
-	}
-
-	if _, ok := widget.(*RadioButton); ok {
-		return 1
-	}
-
-	style := uint(win.GetWindowLong(hwnd, win.GWL_STYLE))
-	// FIXME: Ugly workaround for NumberEdit
-	_, isTextSelectable := widget.(textSelectable)
-	if style&win.WS_TABSTOP > 0 || isTextSelectable {
-		hwndPtr := (*win.HWND)(unsafe.Pointer(lParam))
-		*hwndPtr = hwnd
-		return 0
-	}
-
-	return 1
-}
-
-var firstFocusableDescendantCallbackPtr = syscall.NewCallback(firstFocusableDescendantCallback)
-
-func firstFocusableDescendant(container Container) Window {
-	var hwnd win.HWND
-
-	win.EnumChildWindows(container.Handle(), firstFocusableDescendantCallbackPtr, uintptr(unsafe.Pointer(&hwnd)))
-
-	return windowFromHandle(hwnd)
-}
-
-type textSelectable interface {
-	SetTextSelection(start, end int)
 }

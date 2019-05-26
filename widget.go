@@ -40,6 +40,9 @@ const (
 type Widget interface {
 	Window
 
+	// Alignment returns the alignment of the Widget.
+	Alignment() Alignment2D
+
 	// AlwaysConsumeSpace returns if the Widget should consume space even if it
 	// is not visible.
 	AlwaysConsumeSpace() bool
@@ -64,6 +67,9 @@ type Widget interface {
 	// Parent returns the Container of the Widget.
 	Parent() Container
 
+	// SetAlignment sets the alignment of the widget.
+	SetAlignment(alignment Alignment2D) error
+
 	// SetAlwaysConsumeSpace sets if the Widget should consume space even if it
 	// is not visible.
 	SetAlwaysConsumeSpace(b bool) error
@@ -84,10 +90,12 @@ type Widget interface {
 
 type WidgetBase struct {
 	WindowBase
+	form                        Form
 	parent                      Container
 	toolTipTextProperty         Property
 	toolTipTextChangedPublisher EventPublisher
 	graphicsEffects             *WidgetGraphicsEffectList
+	alignment                   Alignment2D
 	alwaysConsumeSpace          bool
 }
 
@@ -129,7 +137,7 @@ func (wb *WidgetBase) init(widget Widget) error {
 			return wb.window.(Widget).ToolTipText()
 		},
 		func(v interface{}) error {
-			wb.window.(Widget).SetToolTipText(v.(string))
+			wb.window.(Widget).SetToolTipText(assertStringOr(v, ""))
 			return nil
 		},
 		wb.toolTipTextChangedPublisher.Event())
@@ -144,12 +152,12 @@ func (wb *WidgetBase) AsWidgetBase() *WidgetBase {
 	return wb
 }
 
-// Bounds returns the outer bounding box Rectangle of the WidgetBase, including
+// BoundsPixels returns the outer bounding box Rectangle of the WidgetBase, including
 // decorations.
 //
 // The coordinates are relative to the parent of the Widget.
-func (wb *WidgetBase) Bounds() Rectangle {
-	b := wb.WindowBase.Bounds()
+func (wb *WidgetBase) BoundsPixels() Rectangle {
+	b := wb.WindowBase.BoundsPixels()
 
 	if wb.parent != nil {
 		p := win.POINT{int32(b.X), int32(b.Y)}
@@ -205,7 +213,31 @@ func (wb *WidgetBase) applyFont(font *Font) {
 
 // Form returns the root ancestor Form of the Widget.
 func (wb *WidgetBase) Form() Form {
-	return ancestor(wb)
+	if wb.form == nil {
+		wb.form = ancestor(wb)
+	}
+
+	return wb.form
+}
+
+// Alignment return the alignment ot the *WidgetBase.
+func (wb *WidgetBase) Alignment() Alignment2D {
+	return wb.alignment
+}
+
+// SetAlignment sets the alignment of the *WidgetBase.
+func (wb *WidgetBase) SetAlignment(alignment Alignment2D) error {
+	if alignment != wb.alignment {
+		if alignment < AlignHVDefault || alignment > AlignHFarVFar {
+			return newError("invalid Alignment value")
+		}
+
+		wb.alignment = alignment
+
+		wb.updateParentLayout()
+	}
+
+	return nil
 }
 
 // LayoutFlags returns a combination of LayoutFlags that specify how the
@@ -264,6 +296,8 @@ func (wb *WidgetBase) SetParent(parent Container) (err error) {
 	}
 
 	if parent == nil {
+		wb.SetVisible(false)
+
 		style &^= win.WS_CHILD
 		style |= win.WS_POPUP
 
@@ -287,7 +321,7 @@ func (wb *WidgetBase) SetParent(parent Container) (err error) {
 		}
 	}
 
-	b := wb.Bounds()
+	b := wb.BoundsPixels()
 
 	if !win.SetWindowPos(
 		wb.hWnd,
@@ -328,6 +362,20 @@ func (wb *WidgetBase) SetParent(parent Container) (err error) {
 	}
 
 	return nil
+}
+
+func (wb *WidgetBase) ForEachAncestor(f func(window Window) bool) {
+	hwnd := win.GetParent(wb.hWnd)
+
+	for hwnd != 0 {
+		if window := windowFromHandle(hwnd); window != nil {
+			if !f(window) {
+				return
+			}
+		}
+
+		hwnd = win.GetParent(hwnd)
+	}
 }
 
 // SizeHint returns a default Size that should be "overidden" by a concrete
@@ -377,11 +425,7 @@ func (wb *WidgetBase) onClearedGraphicsEffects() error {
 
 func (wb *WidgetBase) invalidateBorderInParent() {
 	if wb.parent != nil && wb.parent.Layout() != nil {
-		//if _, ok := wb.parent.(*Splitter); ok {
-		//	return
-		//}
-
-		b := wb.Bounds().toRECT()
+		b := wb.BoundsPixels().toRECT()
 		s := int32(wb.parent.Layout().Spacing())
 
 		hwnd := wb.parent.Handle()
@@ -400,53 +444,88 @@ func (wb *WidgetBase) invalidateBorderInParent() {
 	}
 }
 
+func (wb *WidgetBase) hasComplexBackground() bool {
+	if bg := wb.window.Background(); bg != nil && !bg.simple() {
+		return false
+	}
+
+	var complex bool
+	wb.ForEachAncestor(func(window Window) bool {
+		if bg := window.Background(); bg != nil && !bg.simple() {
+			complex = true
+			return false
+		}
+
+		return true
+	})
+
+	return complex
+}
+
 func (wb *WidgetBase) updateParentLayout() error {
+	return wb.updateParentLayoutWithReset(false)
+}
+
+func (wb *WidgetBase) updateParentLayoutWithReset(reset bool) error {
+	if form := wb.Form(); form == nil || form.Suspended() {
+		return nil
+	}
+
 	parent := wb.window.(Widget).Parent()
 
-	if parent == nil || parent.Layout() == nil || parent.Suspended() || !parent.Visible() {
+	if parent == nil || parent.Layout() == nil {
 		return nil
 	}
 
 	layout := parent.Layout()
 
-	if !formResizeScheduled || len(inProgressEventsByForm[appSingleton.activeForm]) == 0 {
-		clientSize := parent.ClientBounds().Size()
-		minSize := layout.MinSize()
+	if lb, ok := layout.(interface{ sizeAndDPIToMinSize() map[sizeAndDPI]Size }); ok {
+		sizeAndDPI2MinSize := lb.sizeAndDPIToMinSize()
 
-		if clientSize.Width < minSize.Width || clientSize.Height < minSize.Height {
-			switch wnd := parent.(type) {
-			case *ScrollView:
-				ifContainerIsScrollViewDoCoolSpecialLayoutStuff(layout)
-				return nil
+		for k := range sizeAndDPI2MinSize {
+			delete(sizeAndDPI2MinSize, k)
+		}
+	}
 
-			case Widget:
-				return wnd.AsWidgetBase().updateParentLayout()
+	updateLayoutAndMaybeInvalidateBorder := func() {
+		layout.Update(reset)
 
-			case Form:
-				if len(inProgressEventsByForm[appSingleton.activeForm]) > 0 {
-					formResizeScheduled = true
-				} else {
-					bounds := wnd.Bounds()
-
-					if wnd.AsFormBase().fixedSize() {
-						bounds.Width, bounds.Height = 0, 0
-					}
-
-					wnd.SetBounds(bounds)
-
-					return nil
-				}
+		if FocusEffect != nil {
+			if focusedWnd := windowFromHandle(win.GetFocus()); focusedWnd != nil && win.GetParent(focusedWnd.Handle()) == parent.Handle() {
+				focusedWnd.(Widget).AsWidgetBase().invalidateBorderInParent()
 			}
 		}
 	}
 
-	layout.Update(false)
+	if !formResizeScheduled || len(inProgressEventsByForm[appSingleton.activeForm]) == 0 {
+		switch wnd := parent.(type) {
+		case *ScrollView:
+			ifContainerIsScrollViewDoCoolSpecialLayoutStuff(layout)
+			wnd.updateCompositeSize()
+			updateLayoutAndMaybeInvalidateBorder()
+			return nil
 
-	if FocusEffect != nil {
-		if focusedWnd := windowFromHandle(win.GetFocus()); focusedWnd != nil && win.GetParent(focusedWnd.Handle()) == parent.Handle() {
-			focusedWnd.(Widget).AsWidgetBase().invalidateBorderInParent()
+		case Widget:
+			return wnd.AsWidgetBase().updateParentLayoutWithReset(reset)
+
+		case Form:
+			if len(inProgressEventsByForm[appSingleton.activeForm]) > 0 {
+				formResizeScheduled = true
+			} else {
+				bounds := wnd.BoundsPixels()
+
+				if wnd.AsFormBase().fixedSize() {
+					bounds.Width, bounds.Height = 0, 0
+				}
+
+				wnd.SetBoundsPixels(bounds)
+
+				return nil
+			}
 		}
 	}
+
+	updateLayoutAndMaybeInvalidateBorder()
 
 	return nil
 }
@@ -463,9 +542,9 @@ func ancestor(w Widget) Form {
 }
 
 func minSizeEffective(w Widget) Size {
-	s := maxSize(w.MinSize(), w.MinSizeHint())
+	s := maxSize(w.MinSizePixels(), w.MinSizeHint())
 
-	max := w.MaxSize()
+	max := w.MaxSizePixels()
 	if max.Width > 0 && s.Width > max.Width {
 		s.Width = max.Width
 	}
