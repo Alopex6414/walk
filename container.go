@@ -433,6 +433,12 @@ func (cb *ContainerBase) applyFont(font *Font) {
 	applyFontToDescendants(cb.window.(Widget), font)
 }
 
+func (cb *ContainerBase) ApplySysColors() {
+	cb.WidgetBase.ApplySysColors()
+
+	applySysColorsToDescendants(cb.window.(Widget))
+}
+
 func (cb *ContainerBase) ApplyDPI(dpi int) {
 	cb.WidgetBase.ApplyDPI(dpi)
 
@@ -815,20 +821,11 @@ func (cb *ContainerBase) focusFirstCandidateDescendant() {
 }
 
 func firstFocusableDescendantCallback(hwnd win.HWND, lParam uintptr) uintptr {
-	widget := windowFromHandle(hwnd)
-
-	if widget == nil || !widget.Visible() || !widget.Enabled() {
+	if !win.IsWindowVisible(hwnd) || !win.IsWindowEnabled(hwnd) {
 		return 1
 	}
 
-	if _, ok := widget.(*RadioButton); ok {
-		return 1
-	}
-
-	style := uint(win.GetWindowLong(hwnd, win.GWL_STYLE))
-	// FIXME: Ugly workaround for NumberEdit
-	_, isTextSelectable := widget.(textSelectable)
-	if style&win.WS_TABSTOP > 0 || isTextSelectable {
+	if win.GetWindowLong(hwnd, win.GWL_STYLE)&win.WS_TABSTOP > 0 {
 		hwndPtr := (*win.HWND)(unsafe.Pointer(lParam))
 		*hwndPtr = hwnd
 		return 0
@@ -844,7 +841,14 @@ func firstFocusableDescendant(container Container) Window {
 
 	win.EnumChildWindows(container.Handle(), firstFocusableDescendantCallbackPtr, uintptr(unsafe.Pointer(&hwnd)))
 
-	return windowFromHandle(hwnd)
+	window := windowFromHandle(hwnd)
+
+	for hwnd != 0 && window == nil {
+		hwnd = win.GetParent(hwnd)
+		window = windowFromHandle(hwnd)
+	}
+
+	return window
 }
 
 type textSelectable interface {

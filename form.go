@@ -104,6 +104,7 @@ type FormBase struct {
 	proposedSize          Size
 	isInRestoreState      bool
 	started               bool
+	didSetFocus           bool
 	closeReason           CloseReason
 }
 
@@ -328,6 +329,11 @@ func (fb *FormBase) applyFont(font *Font) {
 	fb.clientComposite.applyFont(font)
 }
 
+func (fb *FormBase) ApplySysColors() {
+	fb.WindowBase.ApplySysColors()
+	fb.clientComposite.ApplySysColors()
+}
+
 func (fb *FormBase) Background() Brush {
 	return fb.clientComposite.Background()
 }
@@ -392,34 +398,7 @@ func (fb *FormBase) Run() int {
 
 	fb.SetBoundsPixels(fb.BoundsPixels())
 
-	msg := (*win.MSG)(unsafe.Pointer(win.GlobalAlloc(0, unsafe.Sizeof(win.MSG{}))))
-	defer win.GlobalFree(win.HGLOBAL(unsafe.Pointer(msg)))
-
-	for fb.hWnd != 0 {
-		switch win.GetMessage(msg, 0, 0, 0) {
-		case 0:
-			return int(msg.WParam)
-
-		case -1:
-			return -1
-		}
-
-		switch msg.Message {
-		case win.WM_KEYDOWN:
-			if fb.handleKeyDown(msg) {
-				continue
-			}
-		}
-
-		if !win.IsDialogMessage(fb.hWnd, msg) {
-			win.TranslateMessage(msg)
-			win.DispatchMessage(msg)
-		}
-
-		runSynchronized()
-	}
-
-	return 0
+	return fb.mainLoop()
 }
 
 func (fb *FormBase) handleKeyDown(msg *win.MSG) bool {
@@ -769,6 +748,20 @@ func (fb *FormBase) WndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) u
 
 	case win.WM_SIZE:
 		fb.clientComposite.SetBoundsPixels(fb.window.ClientBoundsPixels())
+
+	case win.WM_SHOWWINDOW:
+		if wParam == win.FALSE {
+			fb.didSetFocus = false
+		}
+
+	case win.WM_PAINT:
+		if !fb.didSetFocus && fb.Visible() {
+			fb.didSetFocus = true
+			fb.clientComposite.focusFirstCandidateDescendant()
+		}
+
+	case win.WM_SYSCOLORCHANGE:
+		fb.ApplySysColors()
 
 	case win.WM_DPICHANGED:
 		wasSuspended := fb.Suspended()
